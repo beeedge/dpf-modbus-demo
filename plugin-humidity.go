@@ -19,11 +19,10 @@ package main
 import (
 	"encoding/binary"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"strconv"
 
-	ds "github.com/beeedge/beethings/pkg/device-access/rest/models"
+	"github.com/beeedge/beethings/pkg/device-access/rest/models"
 	"github.com/beeedge/device-plugin-framework/shared"
 	"github.com/hashicorp/go-hclog"
 	"github.com/hashicorp/go-plugin"
@@ -32,19 +31,7 @@ import (
 
 // Here is a real implementation of device-plugin.
 type Converter struct {
-	logger           hclog.Logger
-	// ConfigMaps For fast searching
-	ModelIdMap       map[string]ds.Model
-	DeviceIdMap      map[string]ds.Device
-	FeatureIdMap     map[string]ds.Feature
-	InputParamIdMap  map[string]ds.Param
-	OutputParamIdMap map[string]ds.Param
-}
-
-// ConvertReportMessage2Devices converts data report request to protocol that device understands for each device of this device model,
-func (c *Converter) ConvertReportMessage2Devices(modelId, featureId string) ([]string, error) {
-	// TODO: concrete implement
-	return []string{"Have a good try!!!"}, nil
+	logger hclog.Logger
 }
 
 // ConvertIssueMessage2Device converts issue request to protocol that device understands, which has four return parameters:
@@ -52,18 +39,27 @@ func (c *Converter) ConvertReportMessage2Devices(modelId, featureId string) ([]s
 // 2. outputMessages: device data report protocols for each of command output param.
 // 3. issueTopic: device issue MQTT topic for input params.
 // 4. issueResponseTopic: device issue response MQ topic for output params.
-func (c *Converter) ConvertIssueMessage2Device(deviceId, modelId, featureId string, values map[string]string) ([]string, []string, string, string, error) {
+func (c *Converter) ConvertIssueMessage2Device(deviceId, modelId, featureId string, values map[string]string, convertedDeviceFeatureMap string) ([]string, []string, string, string, error) {
+	var deviceFeatureMap models.DeviceFeatureMap
+	if err := yaml.Unmarshal([]byte(convertedDeviceFeatureMap), &deviceFeatureMap); err != nil {
+		c.logger.Info("Unmarshal convertedDeviceFeatureMap error: %s\n", err.Error())
+		return nil, nil, "", "", err
+	}
+	c.logger.Info("value = %#v\n", values)
+	c.logger.Info("deviceFeatureMap = %#v\n", deviceFeatureMap)
 	if values != nil {
-		for _, value := range values {
-			switch c.InputParamIdMap[featureId].RegistryType {
+		for k, value := range values {
+			c.logger.Info("k = %s\n", k)
+			switch deviceFeatureMap.InputParamIdMap[k].RegisterType {
 			// Single holding registry length is 16bit, so first need to convert the values to multiple of 16 bit.
 			// If len of value longer than num of holding registry * 16 bits, then keep the values shorter than num of holding registry * 16 bits.
 			// If len of value shorter than num of holding registry * 16 bits, compensation zero to reach num of holding registry * 16 bits.
 			// Coil registry length is 8bit, and others as the same as holding registry.
 			// Here is a example explain how it works.
-			case "holding registry":
-				bytes := make([]byte, c.InputParamIdMap[featureId].RegistryNum*2)
-				for i := 0; i < int(c.InputParamIdMap[featureId].RegistryNum*2); i++ {
+			case models.ModbusRegisterTypeHolding:
+				c.logger.Info("type = %s\n", models.ModbusRegisterTypeHolding)
+				bytes := make([]byte, deviceFeatureMap.InputParamIdMap[k].RegisterNum*2)
+				for i := 0; i < int(deviceFeatureMap.InputParamIdMap[k].RegisterNum*2); i++ {
 					if 2*(i+1)-1 < len(value) {
 						b := value[2*i : 2*(i+1)]
 						v, err := strconv.ParseUint(b, 10, 16)
@@ -73,10 +69,12 @@ func (c *Converter) ConvertIssueMessage2Device(deviceId, modelId, featureId stri
 						bytes[i] = uint8(v)
 					}
 				}
+				c.logger.Info("bytes holding = %s\n", string(bytes))
 				return []string{string(bytes)}, nil, "", "", nil
-			case "coil":
-				bytes := make([]byte, c.InputParamIdMap[featureId].RegistryNum)
-				for i := 0; i < int(c.InputParamIdMap[featureId].RegistryNum); i++ {
+			case models.ModbusRegisterTypeCoil:
+				c.logger.Info("type = %s\n", models.ModbusRegisterTypeCoil)
+				bytes := make([]byte, deviceFeatureMap.InputParamIdMap[k].RegisterNum)
+				for i := 0; i < int(deviceFeatureMap.InputParamIdMap[k].RegisterNum); i++ {
 					if 2*(i+1)-1 < len(value) {
 						b := value[2*i : 2*(i+1)]
 						v, err := strconv.ParseUint(b, 10, 16)
@@ -86,6 +84,7 @@ func (c *Converter) ConvertIssueMessage2Device(deviceId, modelId, featureId stri
 						bytes[i] = uint8(v)
 					}
 				}
+				c.logger.Info("bytes coil = %s\n", string(bytes))
 				return []string{string(bytes)}, nil, "", "", nil
 			}
 		}
@@ -94,7 +93,7 @@ func (c *Converter) ConvertIssueMessage2Device(deviceId, modelId, featureId stri
 }
 
 // ConvertDeviceMessages2MQFormat receives device command issue responses and converts it to RabbitMQ normative format.
-func (c *Converter) ConvertDeviceMessages2MQFormat(messages []string, featureType string) (string, []byte, error) {
+func (c *Converter) ConvertDeviceMessages2MQFormat(messages []string, convertedDeviceFeatureMap string) (string, []byte, error) {
 	// Coil registry length is 8bit, so the length is not enough to convert by binary.BigEndian.Uint16(bytes). So we need to compensation zero to make it to 16bit.
 	// Here is a example explain how it works.
 	if messages != nil && len(messages[0]) > 0 {
@@ -115,63 +114,14 @@ func main() {
 		Output:     os.Stderr,
 		JSONFormat: true,
 	})
-	config, err := loadConfig(os.Getenv("PROTOCOL_CONFIG_PATH"))
-	if err != nil {
-		return
-	}
-	deviceIdMap := make(map[string]ds.Device)
-	modelIdMap := make(map[string]ds.Model)
-	featureIdMap := make(map[string]ds.Feature)
-	inputParamIdMap := make(map[string]ds.Param)
-	outputParamIdMap := make(map[string]ds.Param)
-	for _, d := range config.Devices {
-		logger.Info("deviceId = %s", d.DeviceId)
-		deviceIdMap[d.DeviceId] = d
-	}
-	for _, m := range config.Models {
-		for _, f := range m.Features {
-			logger.Info("featureId = %s", f.Id)
-			featureIdMap[f.Id] = f
-			if f.Type == "command" {
-				for _, in := range f.InputParams {
-					logger.Info("input = %s", in.Id)
-					inputParamIdMap[in.Id] = in
-				}
-				for _, out := range f.OutputParams {
-					logger.Info("output = %s", out.Id)
-					outputParamIdMap[out.Id] = out
-				}
-			}
-		}
-		logger.Info("modelId = %s", m.ModelId)
-		modelIdMap[m.ModelId] = m
-	}
 	plugin.Serve(&plugin.ServeConfig{
 		HandshakeConfig: shared.Handshake,
 		Plugins: map[string]plugin.Plugin{
 			"converter": &shared.ConverterPlugin{Impl: &Converter{
-				logger:           logger,
-				ModelIdMap:       modelIdMap,
-				DeviceIdMap:      deviceIdMap,
-				FeatureIdMap:     featureIdMap,
-				InputParamIdMap:  inputParamIdMap,
-				OutputParamIdMap: outputParamIdMap,
+				logger: logger,
 			}},
 		},
-
 		// A non-nil value here enables gRPC serving for this plugin...
 		GRPCServer: plugin.DefaultGRPCServer,
 	})
-}
-
-func loadConfig(path string) (*ds.Protocol, error) {
-	c := &ds.Protocol{}
-	contents, err := ioutil.ReadFile(path)
-	if err != nil {
-		return nil, fmt.Errorf("Failed to read configuration file %s, error %s", path, err)
-	}
-	if err = yaml.Unmarshal(contents, c); err != nil {
-		return nil, fmt.Errorf("Failed to parse configuration, error %s", err)
-	}
-	return c, nil
 }
